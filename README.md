@@ -119,3 +119,45 @@ Annotations should contain verified, reusable information only. Do not persist t
 - Keep source content separate from AI-derived annotations.
 - Monitor ingestion failures, OCR failures, index size, and MCP latency.
 - Start with BM25 search. Add local embeddings only if evaluation shows a measurable improvement.
+
+## Goal
+
+Provide AI clients with fast access to relevant historical discussions, attachments, OCR text, and accumulated annotations so they can reuse previously discovered knowledge instead of rediscovering it on every request.
+
+## Browser connector (Playwright)
+
+When a source API is unavailable but the signed-in web UI is accessible, the optional
+Playwright connector can ingest a channel through the browser. It uses a persistent
+Chromium profile and normal interactive login/MFA; it does not call undocumented Teams
+HTTP endpoints.
+
+Install it:
+
+```bash
+pip install -e '.[teams-web]'
+playwright install chromium
+```
+
+Example:
+
+```python
+from thread_knowledge.connectors.teams_web import TeamsWebConnector
+
+async with TeamsWebConnector(
+    channel_url="https://teams.microsoft.com/...",
+    profile_dir=".teams-web-profile",
+    attachment_dir="data/teams-web-attachments",
+    headless=False,
+) as connector:
+    async for thread_id in connector.iter_thread_ids(limit=100):
+        thread = await connector.load_thread(thread_id)
+```
+
+On the first run, finish login/MFA in the opened browser. The profile is reused later.
+The connector snapshots channel roots and expanded replies while scrolling because Teams
+virtualizes older content. Rendered screenshots are saved locally and then flow through
+the same OCR pipeline as attachments from any other connector.
+
+Browser ingestion is inherently more fragile than a supported source API. Keep the
+Playwright-specific selectors isolated in `connectors/teams_web.py` and expect to update
+them after major Teams UI changes.

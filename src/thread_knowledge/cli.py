@@ -9,6 +9,7 @@ from pathlib import Path
 
 from thread_knowledge.connectors.fixture import FixtureConnector
 from thread_knowledge.connectors.hackernews import HackerNewsConnector
+from thread_knowledge.connectors.teams_web import TeamsWebConnector
 from thread_knowledge.ingestion import build_search_document
 from thread_knowledge.ocr.base import NoopOcr
 from thread_knowledge.ocr.docling import DoclingOcr
@@ -62,6 +63,24 @@ async def index_hn(limit: int, ocr_name: str) -> None:
         await index_connector(connector, limit=limit, ocr_name=ocr_name)
 
 
+
+
+async def index_teams_web(
+    channel_url: str,
+    profile_dir: Path,
+    attachment_dir: Path,
+    limit: int | None,
+    ocr_name: str,
+    headless: bool,
+) -> None:
+    async with TeamsWebConnector(
+        channel_url=channel_url,
+        profile_dir=profile_dir,
+        attachment_dir=attachment_dir,
+        headless=headless,
+    ) as connector:
+        await index_connector(connector, limit=limit, ocr_name=ocr_name)
+
 async def index_fixtures(directory: Path, limit: int | None, ocr_name: str) -> None:
     connector = FixtureConnector(directory)
     await index_connector(connector, limit=limit, ocr_name=ocr_name)
@@ -81,6 +100,22 @@ def main() -> None:
     index_hn_cmd.add_argument("--limit", type=int, default=20)
     index_hn_cmd.add_argument("--ocr", choices=["none", "docling"], default="none")
 
+
+    teams_web_cmd = sub.add_parser(
+        "index-teams-web",
+        help="Ingest a channel through an authenticated Teams Web browser session",
+    )
+    teams_web_cmd.add_argument("channel_url")
+    teams_web_cmd.add_argument("--profile-dir", type=Path, default=Path(".teams-web-profile"))
+    teams_web_cmd.add_argument(
+        "--attachment-dir",
+        type=Path,
+        default=Path("data/teams-web-attachments"),
+    )
+    teams_web_cmd.add_argument("--limit", type=int)
+    teams_web_cmd.add_argument("--ocr", choices=["none", "docling"], default="docling")
+    teams_web_cmd.add_argument("--headless", action="store_true")
+
     index_fixture_cmd = sub.add_parser("index-fixtures", help="Ingest fixture threads into OpenSearch")
     index_fixture_cmd.add_argument("directory", type=Path)
     index_fixture_cmd.add_argument("--limit", type=int)
@@ -96,6 +131,17 @@ def main() -> None:
         print(f"index ready: {store.index}")
     elif args.command == "index-hn":
         asyncio.run(index_hn(args.limit, args.ocr))
+    elif args.command == "index-teams-web":
+        asyncio.run(
+            index_teams_web(
+                args.channel_url,
+                args.profile_dir,
+                args.attachment_dir,
+                args.limit,
+                args.ocr,
+                args.headless,
+            )
+        )
     elif args.command == "index-fixtures":
         asyncio.run(index_fixtures(args.directory, args.limit, args.ocr))
 
