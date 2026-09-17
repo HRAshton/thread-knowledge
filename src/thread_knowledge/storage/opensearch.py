@@ -15,6 +15,7 @@ INDEX_MAPPING: dict[str, Any] = {
             "title": {"type": "text"},
             "source_url": {"type": "keyword", "index": False},
             "created_at": {"type": "date"},
+            "content_hash": {"type": "keyword"},
             "messages": {
                 "type": "nested",
                 "properties": {
@@ -37,6 +38,7 @@ INDEX_MAPPING: dict[str, Any] = {
                     "media_type": {"type": "keyword"},
                     "url": {"type": "keyword", "index": False},
                     "local_path": {"type": "keyword", "index": False},
+                    "content_hash": {"type": "keyword"},
                     "ocr_text": {"type": "text"},
                 },
             },
@@ -57,14 +59,45 @@ INDEX_MAPPING: dict[str, Any] = {
 }
 
 
+OCR_CACHE_MAPPING: dict[str, Any] = {
+    "settings": {"index": {"number_of_shards": 1, "number_of_replicas": 0}},
+    "mappings": {
+        "dynamic": "strict",
+        "properties": {
+            "content_hash": {"type": "keyword"},
+            "ocr_text": {"type": "text", "index": False},
+            "updated_at": {"type": "date"},
+        },
+    },
+}
+
+
 class OpenSearchThreadStore:
     def __init__(self, client: Any, index: str = "thread-knowledge") -> None:
         self.client = client
         self.index = index
+        self.ocr_cache_index = f"{index}-ocr-cache"
 
     def ensure_index(self) -> None:
         if not self.client.indices.exists(index=self.index):
             self.client.indices.create(index=self.index, body=INDEX_MAPPING)
+        else:
+            # Add fields introduced by incremental ingestion without requiring a
+            # destructive index rebuild. OpenSearch accepts additive mapping updates.
+            self.client.indices.put_mapping(
+                index=self.index,
+                body={
+                    "properties": {
+                        "content_hash": {"type": "keyword"},
+                        "attachments": {
+                            "type": "nested",
+                            "properties": {"content_hash": {"type": "keyword"}},
+                        },
+                    }
+                },
+            )
+        if not self.client.indices.exists(index=self.ocr_cache_index):
+            self.client.indices.create(index=self.ocr_cache_index, body=OCR_CACHE_MAPPING)
 
     def upsert_thread(self, document: dict[str, Any]) -> None:
         self.client.index(
@@ -83,6 +116,27 @@ class OpenSearchThreadStore:
                 return None
             raise
         return response.get("_source")
+
+    def get_cached_ocr(self, content_hash: str) -> str | None:
+        try:
+            response = self.client.get(index=self.ocr_cache_index, id=content_hash)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return None
+            raise
+        return (response.get("_source") or {}).get("ocr_text")
+
+    def cache_ocr(self, content_hash: str, text: str) -> None:
+        self.client.index(
+            index=self.ocr_cache_index,
+            id=content_hash,
+            body={
+                "content_hash": content_hash,
+                "ocr_text": text,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            refresh=False,
+        )
 
     @staticmethod
     def lexical_query(query: str, limit: int) -> dict[str, Any]:
