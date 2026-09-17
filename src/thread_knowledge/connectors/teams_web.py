@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import mimetypes
 import re
@@ -285,25 +286,267 @@ class TeamsWebConnector:
                 continue
 
             attachment_id = f"{message_id}:image:{idx}"
-            suffix = self._image_suffix(src)
-            local_path = self.attachment_dir / f"{self._safe_name(attachment_id)}{suffix}"
+            attachment = await self._materialize_best_image_attachment(
+                image=image,
+                attachment_id=attachment_id,
+                fallback_name=alt,
+            )
+            if attachment is not None:
+                attachments.append(attachment)
+        return attachments
+
+
+    async def _materialize_best_image_attachment(
+        self,
+        *,
+        image: Any,
+        attachment_id: str,
+        fallback_name: str,
+    ) -> Attachment | None:
+        metadata = await self._collect_image_metadata(image)
+        candidates = list(metadata["candidates"])
+        viewer_metadata = await self._collect_viewer_image_metadata(image)
+        if viewer_metadata is not None:
+            candidates = self._merge_candidate_lists(viewer_metadata["candidates"], candidates)
+            metadata = self._prefer_larger_metadata(metadata, viewer_metadata)
+
+        downloaded = await self._download_best_candidate(candidates, attachment_id)
+        if downloaded is not None:
+            local_path, content_type, chosen_url = downloaded
+            media_type, _ = mimetypes.guess_type(local_path.name)
+            return Attachment(
+                kind="image",
+                url=chosen_url,
+                name=fallback_name or local_path.name,
+                media_type=content_type or media_type or "image/png",
+                local_path=str(local_path),
+                external_id=attachment_id,
+            )
+
+        # Last resort: capture the best rendered image available. Prefer the image seen
+        # in the full-screen viewer if it was opened successfully.
+        target = image
+        chosen_url = metadata.get("current_src") or metadata.get("src")
+        if viewer_metadata is not None and viewer_metadata.get("locator") is not None:
+            target = viewer_metadata["locator"]
+            chosen_url = viewer_metadata.get("current_src") or viewer_metadata.get("src") or chosen_url
+
+        suffix = self._image_suffix(chosen_url or "")
+        local_path = self.attachment_dir / f"{self._safe_name(attachment_id)}{suffix}"
+        try:
+            await target.screenshot(path=str(local_path))
+        except Exception:
+            return None
+
+        media_type, _ = mimetypes.guess_type(local_path.name)
+        return Attachment(
+            kind="image",
+            url=chosen_url,
+            name=fallback_name or local_path.name,
+            media_type=media_type or "image/png",
+            local_path=str(local_path),
+            external_id=attachment_id,
+        )
+
+    async def _collect_image_metadata(self, image: Any) -> dict[str, Any]:
+        data = await image.evaluate(
+            """
+            el => {
+              const attrs = {};
+              for (const name of el.getAttributeNames()) attrs[name] = el.getAttribute(name);
+              const parseSrcset = (value) => {
+                if (!value) return [];
+                return value
+                  .split(',')
+                  .map(part => part.trim())
+                  .filter(Boolean)
+                  .map(part => {
+                    const [url, descriptor] = part.split(/\\s+/, 2);
+                    let width = 0;
+                    if (descriptor && descriptor.endsWith('w')) width = parseInt(descriptor.slice(0, -1), 10) || 0;
+                    return {url, width};
+                  });
+              };
+              const candidates = [];
+              const add = (url, width = 0, source = 'unknown') => {
+                if (!url || typeof url !== 'string') return;
+                if (url.startsWith('data:image/svg')) return;
+                candidates.push({url, width, source});
+              };
+
+              add(el.currentSrc || '', el.naturalWidth || 0, 'currentSrc');
+              add(el.src || '', el.naturalWidth || 0, 'src');
+              for (const item of parseSrcset(el.srcset || '')) add(item.url, item.width, 'srcset');
+
+              for (const [name, value] of Object.entries(attrs)) {
+                if (!value) continue;
+                if (name === 'src' || name === 'srcset') continue;
+                const lower = name.toLowerCase();
+                if (lower.includes('srcset')) {
+                  for (const item of parseSrcset(value)) add(item.url, item.width, lower);
+                } else if (lower.includes('src') || lower.includes('url') || lower.includes('full')) {
+                  add(String(value), 0, lower);
+                }
+              }
+
+              return {
+                src: el.src || null,
+                current_src: el.currentSrc || null,
+                natural_width: el.naturalWidth || 0,
+                natural_height: el.naturalHeight || 0,
+                candidates,
+              };
+            }
+            """
+        )
+        data["candidates"] = self._dedupe_candidates(data.get("candidates") or [])
+        return data
+
+    async def _collect_viewer_image_metadata(self, image: Any) -> dict[str, Any] | None:
+        assert self._page is not None
+        dialog_selectors = (
+            '[role="dialog"] img[src]',
+            '[aria-modal="true"] img[src]',
+            '[data-tid="image-content"] img[src]',
+            '[data-tid="media-viewer"] img[src]',
+        )
+        try:
+            await image.click(button='left', timeout=3_000)
+            await asyncio.sleep(0.8)
+        except Exception:
+            return None
+
+        loc = None
+        for selector in dialog_selectors:
+            candidate = self._page.locator(selector)
             try:
-                await image.screenshot(path=str(local_path))
+                count = await candidate.count()
             except Exception:
                 continue
+            if not count:
+                continue
+            for idx in range(count - 1, -1, -1):
+                item = candidate.nth(idx)
+                try:
+                    if await item.is_visible():
+                        loc = item
+                        break
+                except Exception:
+                    continue
+            if loc is not None:
+                break
 
-            media_type, _ = mimetypes.guess_type(local_path.name)
-            attachments.append(
-                Attachment(
-                    kind="image",
-                    url=src,
-                    name=alt or local_path.name,
-                    media_type=media_type or "image/png",
-                    local_path=str(local_path),
-                    external_id=attachment_id,
-                )
+        if loc is None:
+            await self._dismiss_image_viewer()
+            return None
+
+        try:
+            metadata = await self._collect_image_metadata(loc)
+            metadata["locator"] = loc
+            return metadata
+        except Exception:
+            return None
+        finally:
+            await self._dismiss_image_viewer()
+
+    async def _dismiss_image_viewer(self) -> None:
+        assert self._page is not None
+        try:
+            await self._page.keyboard.press('Escape')
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
+
+    async def _download_best_candidate(
+        self,
+        candidates: list[dict[str, Any]],
+        attachment_id: str,
+    ) -> tuple[Path, str | None, str] | None:
+        for candidate in candidates:
+            url = candidate.get("url")
+            if not url:
+                continue
+            response = await self._fetch_url_bytes(url)
+            if response is None:
+                continue
+            suffix = self._image_suffix(url)
+            local_path = self.attachment_dir / f"{self._safe_name(attachment_id)}{suffix}"
+            local_path.write_bytes(response["content"])
+            return local_path, response.get("content_type"), url
+        return None
+
+    async def _fetch_url_bytes(self, url: str) -> dict[str, Any] | None:
+        assert self._page is not None
+        try:
+            payload = await self._page.evaluate(
+                """
+                async (url) => {
+                  try {
+                    const response = await fetch(url, {credentials: 'include'});
+                    if (!response.ok) {
+                      return {ok: false, status: response.status, reason: `HTTP ${response.status}`};
+                    }
+                    const blob = await response.blob();
+                    const dataUrl = await new Promise((resolve, reject) => {
+                      const reader = new FileReader();
+                      reader.onerror = () => reject(new Error('file-reader-error'));
+                      reader.onload = () => resolve(String(reader.result));
+                      reader.readAsDataURL(blob);
+                    });
+                    return {
+                      ok: true,
+                      content_type: blob.type || response.headers.get('content-type') || null,
+                      data_url: dataUrl,
+                    };
+                  } catch (error) {
+                    return {ok: false, reason: String(error)};
+                  }
+                }
+                """,
+                url,
             )
-        return attachments
+        except Exception:
+            return None
+        if not payload or not payload.get("ok"):
+            return None
+        data_url = payload.get("data_url") or ""
+        try:
+            _, encoded = data_url.split(',', 1)
+            content = base64.b64decode(encoded)
+        except Exception:
+            return None
+        return {"content": content, "content_type": payload.get("content_type")}
+
+    @staticmethod
+    def _dedupe_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: dict[str, dict[str, Any]] = {}
+        for item in candidates:
+            url = item.get("url")
+            if not url or url.startswith('data:image/svg'):
+                continue
+            if url.startswith('data:'):
+                continue
+            current = seen.get(url)
+            if current is None or int(item.get("width") or 0) > int(current.get("width") or 0):
+                seen[url] = {
+                    "url": url,
+                    "width": int(item.get("width") or 0),
+                    "source": item.get("source") or "unknown",
+                }
+        return sorted(seen.values(), key=lambda value: value.get("width", 0), reverse=True)
+
+    @staticmethod
+    def _merge_candidate_lists(*lists: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        for items in lists:
+            merged.extend(items)
+        return TeamsWebConnector._dedupe_candidates(merged)
+
+    @staticmethod
+    def _prefer_larger_metadata(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
+        primary_area = int(primary.get("natural_width") or 0) * int(primary.get("natural_height") or 0)
+        secondary_area = int(secondary.get("natural_width") or 0) * int(secondary.get("natural_height") or 0)
+        return secondary if secondary_area > primary_area else primary
 
     async def _scroll_to_older(self) -> bool:
         assert self._page is not None
